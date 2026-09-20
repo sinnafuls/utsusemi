@@ -7,7 +7,7 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{serve_tunnel, Dialer, ExitPolicy, Relay};
+use super::{serve_tunnel, ExitPolicy, Relay};
 use crate::endpoint::Scheme;
 use crate::upstream::{self, split_authority, Tunnel, UpstreamError};
 
@@ -92,11 +92,7 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
             &target,
             body_prefix,
             ExitPolicy::default(),
-            Dialer::Tunnel {
-                upstream: relay.upstream.clone(),
-                host: host.into(),
-                port,
-            },
+            relay.tunnel_dialer(&host, port),
         )
         .await;
         return Ok(());
@@ -168,14 +164,8 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
         // The replayed payload is the whole absolute-form request, so a raw
         // connection to the backbone is all a replacement needs; only SOCKS5
         // has to redo a handshake.
-        Scheme::Http => Dialer::Raw {
-            upstream: relay.upstream.clone(),
-        },
-        Scheme::Socks5 => Dialer::Tunnel {
-            upstream: relay.upstream.clone(),
-            host: host.into(),
-            port,
-        },
+        Scheme::Http => relay.raw_dialer(),
+        Scheme::Socks5 => relay.tunnel_dialer(&host, port),
     };
     // Replaying is only safe for methods that may be sent twice. A POST that
     // a silent exit had already forwarded must not be duplicated.

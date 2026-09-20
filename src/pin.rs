@@ -58,25 +58,42 @@ pub async fn hunt(relay: &Relay) -> Option<Endpoint> {
     None
 }
 
-/// Watch the failure counter and re-hunt whenever the pinned exit stops
-/// carrying traffic. Runs for the life of the relay.
+/// Watch for exits that go silent and replace them. Runs for the life of the
+/// relay.
+///
+/// Only silent exits count. A target the proxy refuses, or a client that
+/// speaks nonsense at the listener, is not a reason to throw away an exit
+/// that is carrying everything else — reacting to those churned through a
+/// working exit every few seconds.
 pub async fn maintain(relay: Relay) {
-    let mut seen = relay.stats.snapshot().failed;
+    let mut seen = relay.stats.snapshot().silent_exits;
 
     loop {
         tokio::time::sleep(CHECK_INTERVAL).await;
 
-        let failed = relay.stats.snapshot().failed;
-        let fresh = failed.saturating_sub(seen);
-        seen = failed;
+        let silent = relay.stats.snapshot().silent_exits;
+        let fresh = silent.saturating_sub(seen);
+        seen = silent;
 
         if fresh < FAILURE_TRIGGER {
             continue;
         }
-        tracing::info!("{fresh} connections found no exit, hunting a new one");
+
+        // Confirm before replacing: under a burst of parallel connections the
+        // current exit can drop a few and still be the best one available.
+        let current = relay.upstream.get();
+        if upstream::probe(&current).await.is_ok() {
+            tracing::debug!(
+                "{fresh} silent tunnels, but {} still answers; keeping it",
+                current.redacted()
+            );
+            continue;
+        }
+
+        tracing::info!("{fresh} tunnels found no exit and the current one is dead, hunting");
         if hunt(&relay).await.is_some() {
-            // Failures raised while hunting belong to the old exit.
-            seen = relay.stats.snapshot().failed;
+            // Silence raised while hunting belongs to the old exit.
+            seen = relay.stats.snapshot().silent_exits;
         }
     }
 }

@@ -880,8 +880,13 @@ fn cmd_status(json: bool) -> Result<()> {
         if status.system_proxy { "on" } else { "off (local listeners only)" }
     );
     println!("Uptime       {}", format_duration(status.uptime_secs));
+    let silent = if s.silent_exits > 0 {
+        format!(" ({} of them silent exits)", s.silent_exits)
+    } else {
+        String::new()
+    };
     println!(
-        "Connections  {} active, {} total, {} failed",
+        "Connections  {} active, {} total, {} failed{silent}",
         s.active, s.total, s.failed
     );
     println!(

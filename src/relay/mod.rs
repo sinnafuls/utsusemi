@@ -22,6 +22,11 @@ pub struct Stats {
     pub active: AtomicU64,
     pub total: AtomicU64,
     pub failed: AtomicU64,
+    /// Failures caused by exits that took the tunnel and answered nothing.
+    /// Kept apart from `failed` because only these say the exit is bad: a
+    /// target the proxy refuses (403) or a client speaking nonsense would
+    /// otherwise keep throwing away a perfectly good exit.
+    pub silent_exits: AtomicU64,
     pub up_bytes: AtomicU64,
     pub down_bytes: AtomicU64,
     /// Why the most recent attempt failed, and when. A bare failure count
@@ -41,6 +46,7 @@ impl Stats {
             active: self.active.load(Ordering::Relaxed),
             total: self.total.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
+            silent_exits: self.silent_exits.load(Ordering::Relaxed),
             up_bytes: self.up_bytes.load(Ordering::Relaxed),
             down_bytes: self.down_bytes.load(Ordering::Relaxed),
             last_failure,
@@ -56,6 +62,13 @@ impl Stats {
         }
     }
 
+    /// Count a failure that is the exit's fault: it accepted the tunnel and
+    /// never spoke.
+    pub fn fail_silent_exit(&self, reason: impl Into<String>) {
+        self.silent_exits.fetch_add(1, Ordering::Relaxed);
+        self.fail(reason);
+    }
+
     fn last_failure(&self) -> Option<(String, Instant)> {
         self.last_failure.lock().ok()?.clone()
     }
@@ -66,6 +79,8 @@ pub struct StatsSnapshot {
     pub active: u64,
     pub total: u64,
     pub failed: u64,
+    #[serde(default)]
+    pub silent_exits: u64,
     pub up_bytes: u64,
     pub down_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,11 +106,19 @@ impl Drop for ActiveGuard {
     }
 }
 
-/// Everything a listener needs: where to forward, and where to count.
+/// Upstream dials allowed at once, across every client connection. Webshare's
+/// base residential tier is flagged `is_high_concurrency: false`, and racing
+/// exits multiplies connections fast: without a ceiling the relay answers a
+/// flaky pool by hammering it, which is how a plan gets throttled.
+const MAX_CONCURRENT_DIALS: usize = 8;
+
+/// Everything a listener needs: where to forward, where to count, and how
+/// much of the backbone it may use at once.
 #[derive(Clone)]
 pub struct Relay {
     pub upstream: UpstreamHandle,
     pub stats: Arc<Stats>,
+    dial_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Relay {
@@ -103,14 +126,44 @@ impl Relay {
         Relay {
             upstream,
             stats: Arc::new(Stats::default()),
+            dial_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALS)),
+        }
+    }
+
+    /// A dialer for tunnels to `host:port`, sharing this relay's dial budget.
+    pub fn tunnel_dialer(&self, host: &str, port: u16) -> Dialer {
+        Dialer {
+            kind: DialKind::Tunnel {
+                upstream: self.upstream.clone(),
+                host: host.into(),
+                port,
+            },
+            slots: self.dial_slots.clone(),
+        }
+    }
+
+    /// A dialer for plain connections to the upstream itself.
+    pub fn raw_dialer(&self) -> Dialer {
+        Dialer {
+            kind: DialKind::Raw {
+                upstream: self.upstream.clone(),
+            },
+            slots: self.dial_slots.clone(),
         }
     }
 }
 
 /// Opens replacement tunnels to the same target. Owned and cloneable so that
-/// racing attempts can run as independent tasks.
+/// racing attempts can run as independent tasks, and budgeted so that racing
+/// cannot flood the backbone.
 #[derive(Clone)]
-pub enum Dialer {
+pub struct Dialer {
+    kind: DialKind,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone)]
+enum DialKind {
     /// Handshake a tunnel to `host:port` through the current upstream.
     Tunnel {
         upstream: UpstreamHandle,
@@ -124,13 +177,16 @@ pub enum Dialer {
 
 impl Dialer {
     pub async fn open(&self) -> Result<Tunnel, UpstreamError> {
-        match self {
-            Dialer::Tunnel {
+        // Held for the handshake only: an established tunnel is the client's
+        // to keep, but the stampede of attempts is ours to throttle.
+        let _slot = self.slots.acquire().await;
+        match &self.kind {
+            DialKind::Tunnel {
                 upstream,
                 host,
                 port,
             } => crate::upstream::connect_through(&upstream.get(), host, *port).await,
-            Dialer::Raw { upstream } => {
+            DialKind::Raw { upstream } => {
                 crate::upstream::dial_raw(&upstream.get())
                     .await
                     .map(|stream| Tunnel {
@@ -220,7 +276,9 @@ pub async fn serve_tunnel(
             },
             read = tunnel.stream.read(&mut from_exit) => match read {
                 Ok(0) | Err(_) => {
-                    stats.fail(format!("exit closed the tunnel to {target} without a word"));
+                    stats.fail_silent_exit(format!(
+                        "exit closed the tunnel to {target} without a word"
+                    ));
                     return;
                 }
                 Ok(n) => {
@@ -236,7 +294,7 @@ pub async fn serve_tunnel(
         match race_exits(tunnel, payload, &policy, &dialer, &stats).await {
             Some(live) => tunnel = live,
             None => {
-                stats.fail(format!(
+                stats.fail_silent_exit(format!(
                     "no exit answered for {target} within {}s ({} raced at a time)",
                     policy.budget.as_secs(),
                     policy.max_in_flight
@@ -437,9 +495,7 @@ mod tests {
     /// A dialer that opens plain connections to the fake exit pool.
     fn dialer_to(addr: std::net::SocketAddr) -> Dialer {
         let endpoint: crate::endpoint::Endpoint = addr.to_string().parse().expect("endpoint");
-        Dialer::Raw {
-            upstream: UpstreamHandle::new(endpoint),
-        }
+        Relay::new(UpstreamHandle::new(endpoint)).raw_dialer()
     }
 
     fn sequential() -> ExitPolicy {
