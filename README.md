@@ -160,11 +160,32 @@ which variant Webshare accepts and the exact flags to reconnect with.
 utsusemi connect germany --rotate        new exit IP on every request
 utsusemi connect germany --sticky        one IP, new random session id
 utsusemi connect germany --sticky 4242   one IP, reuse session id 4242
+utsusemi connect germany --rotate --pin  hunt for an exit that works, keep it
 ```
 
-While connected, `utsusemi rotate` rolls the sticky session id so you get a new
-exit IP without dropping anything. On an endpoint that is already rotating this
-does nothing, because it is already changing IP per request.
+While connected, `utsusemi rotate` hunts a fresh exit: it probes eight
+candidate sessions at once and pins the first that carries traffic, so you get
+a new IP that is known to work rather than a random one that may not be.
+
+### Dead exits, and why `--pin` exists
+
+Residential exits are other people's machines. A share of them accept the
+tunnel and then answer nothing, and that share is not small: measured on a
+live account, fresh exits carried TLS about one time in ten during a bad
+spell, while the same pool served plain HTTP every time. A browser survives
+this by accident — it opens one tunnel per origin and reuses it, so one lucky
+exit serves the whole site.
+
+Utsusemi does three things about it:
+
+- Every new tunnel **races up to four exits** and takes the first that
+  answers, instead of waiting out each dead one in turn.
+- A tunnel that finds no exit at all is **counted and explained** rather than
+  left hanging, so `utsusemi status` names the target that failed.
+- When several connections in a row find nothing, the relay **hunts a working
+  sticky session and pins it**, which is what `--pin` does from the start.
+  Pinning trades rotation for reliability: every request then leaves from the
+  same exit until it goes bad, at which point the hunt runs again.
 
 ### Changing endpoint without disconnecting
 

@@ -228,6 +228,10 @@ struct ConnectArgs {
     /// Talk SOCKS5 to Webshare instead of HTTP (upstream port defaults to 1080)
     #[arg(long)]
     socks5: bool,
+    /// Hunt for an exit that answers and stay on it, instead of taking a new
+    /// one per connection
+    #[arg(long)]
+    pin: bool,
     /// Stay in the foreground and log to the terminal
     #[arg(short = 'f', long)]
     foreground: bool,
@@ -550,6 +554,9 @@ fn spawn_detached(args: &ConnectArgs) -> Result<()> {
     if args.socks5 {
         cmd.arg("--socks5");
     }
+    if args.pin {
+        cmd.arg("--pin");
+    }
     if args.no_system_proxy {
         cmd.arg("--no-system-proxy");
     }
@@ -584,6 +591,9 @@ fn spawn_detached(args: &ConnectArgs) -> Result<()> {
     loop {
         if let Some(st) = RunState::load()? {
             if st.pid == pid {
+                if args.pin {
+                    println!("Pinned    {}", st.endpoint.redacted());
+                }
                 println!("Listening http://{}  socks5://{}", st.http, st.socks5);
                 if st.system_proxy {
                     println!("System proxy -> {}", st.http);
@@ -644,6 +654,12 @@ async fn daemon_main(args: ConnectArgs, config: Config) -> Result<()> {
 
     let relay = Relay::new(UpstreamHandle::new(endpoint.clone()));
     let want_system_proxy = config.system_proxy.enable && !args.no_system_proxy;
+    if args.pin {
+        match utsusemi::pin::hunt(&relay).await {
+            Some(pinned) => tracing::info!("pinned exit at startup: {}", pinned.redacted()),
+            None => tracing::warn!("no exit answered; staying on {}", endpoint.redacted()),
+        }
+    }
 
     let run_state = RunState {
         pid: std::process::id(),
@@ -652,7 +668,7 @@ async fn daemon_main(args: ConnectArgs, config: Config) -> Result<()> {
         http: http_local.to_string(),
         socks5: socks_local.to_string(),
         profile,
-        endpoint: endpoint.clone(),
+        endpoint: (*relay.upstream.get()).clone(),
         started_at: RunState::now(),
         system_proxy: want_system_proxy,
     };
@@ -679,6 +695,9 @@ async fn daemon_main(args: ConnectArgs, config: Config) -> Result<()> {
     let http_task = tokio::spawn(relay::http::serve(http_listener, relay.clone()));
     let socks_task = tokio::spawn(relay::socks5::serve(socks_listener, relay.clone()));
     let control_task = tokio::spawn(control::serve(control_listener, ctx.clone()));
+    // Not selected on: losing the pinner degrades exit quality, it does not
+    // break the relay.
+    tokio::spawn(utsusemi::pin::maintain(relay.clone()));
 
     let reason = tokio::select! {
         _ = ctx.shutdown.notified() => "stop requested",

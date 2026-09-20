@@ -13,6 +13,7 @@ pub mod config;
 pub mod control;
 pub mod endpoint;
 pub mod ipcheck;
+pub mod pin;
 pub mod relay;
 pub mod state;
 pub mod sysproxy;

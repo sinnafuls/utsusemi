@@ -7,7 +7,7 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{serve_tunnel, ExitPolicy, Relay};
+use super::{serve_tunnel, Dialer, ExitPolicy, Relay};
 use crate::endpoint::Scheme;
 use crate::upstream::{self, split_authority, Tunnel, UpstreamError};
 
@@ -85,7 +85,6 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
         // tunnel, and doubles as the payload replayed if this exit turns out
         // to be a black hole.
         let target = format!("{host}:{port}");
-        let upstream = relay.upstream.clone();
         serve_tunnel(
             client,
             tunnel,
@@ -93,10 +92,10 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
             &target,
             body_prefix,
             ExitPolicy::default(),
-            || {
-                let upstream = upstream.clone();
-                let host = host.clone();
-                async move { upstream::connect_through(&upstream.get(), &host, port).await }
+            Dialer::Tunnel {
+                upstream: relay.upstream.clone(),
+                host: host.into(),
+                port,
             },
         )
         .await;
@@ -165,35 +164,46 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
     payload.extend_from_slice(&body_prefix);
 
     let target = format!("{host}:{port}");
-    let upstream = relay.upstream.clone();
-    let scheme = upstream_endpoint.scheme;
+    let dialer = match upstream_endpoint.scheme {
+        // The replayed payload is the whole absolute-form request, so a raw
+        // connection to the backbone is all a replacement needs; only SOCKS5
+        // has to redo a handshake.
+        Scheme::Http => Dialer::Raw {
+            upstream: relay.upstream.clone(),
+        },
+        Scheme::Socks5 => Dialer::Tunnel {
+            upstream: relay.upstream.clone(),
+            host: host.into(),
+            port,
+        },
+    };
+    // Replaying is only safe for methods that may be sent twice. A POST that
+    // a silent exit had already forwarded must not be duplicated.
+    let policy = if is_replayable(request.method) {
+        ExitPolicy::default()
+    } else {
+        ExitPolicy::single()
+    };
+
     serve_tunnel(
         client,
         tunnel,
         relay.stats.clone(),
         &target,
         payload,
-        ExitPolicy::default(),
-        || {
-            let upstream = upstream.clone();
-            let host = host.clone();
-            async move {
-                let endpoint = upstream.get();
-                match scheme {
-                    // The replayed payload is the whole absolute-form request,
-                    // so a raw connection to the backbone is all that is
-                    // needed; only SOCKS5 has to redo a handshake.
-                    Scheme::Http => upstream::dial_raw(&endpoint).await.map(|stream| Tunnel {
-                        stream,
-                        prelude: Vec::new(),
-                    }),
-                    Scheme::Socks5 => upstream::connect_through(&endpoint, &host, port).await,
-                }
-            }
-        },
+        policy,
+        dialer,
     )
     .await;
     Ok(())
+}
+
+/// Methods RFC 9110 defines as safe or idempotent, and therefore harmless to
+/// send to a second exit when the first one swallowed them.
+fn is_replayable(method: &str) -> bool {
+    ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"]
+        .iter()
+        .any(|m| method.eq_ignore_ascii_case(m))
 }
 
 /// Read the request head, returning it plus any bytes that followed it.

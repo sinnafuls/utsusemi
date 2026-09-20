@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
-use crate::endpoint::{Endpoint, Session, WebshareUser};
+use crate::endpoint::Endpoint;
 use crate::relay::{Relay, StatsSnapshot};
 use crate::state::RunState;
 
@@ -148,20 +148,19 @@ async fn dispatch(envelope: Envelope, ctx: &Arc<ControlContext>) -> Reply {
             Reply::Ok
         }
         Request::Rotate => {
-            let current = ctx.relay.upstream.get();
-            let Some(mut user) = current.webshare_user() else {
+            if ctx.relay.upstream.get().webshare_user().is_none() {
                 return Reply::Error {
                     message: "endpoint has no Webshare username to rotate".into(),
                 };
-            };
-            // A rotating endpoint already picks a new IP per request; rolling a
-            // sticky session id is the only thing rotation can mean here.
-            user.session = match user.session {
-                Session::Rotate => Session::Rotate,
-                _ => Session::Sticky(WebshareUser::new_sticky_id()),
-            };
-            let updated = current.with_username(user.build());
-            apply_switch(ctx, updated).await
+            }
+            // Rolling a random session id lands on a dead exit as often as
+            // the pool is dead, so hunt for one that answers instead.
+            match crate::pin::hunt(&ctx.relay).await {
+                Some(endpoint) => record_switch(ctx, endpoint),
+                None => Reply::Error {
+                    message: "no exit answered; keeping the current one".into(),
+                },
+            }
         }
         Request::Switch { endpoint } => match endpoint.parse::<Endpoint>() {
             Ok(parsed) => apply_switch(ctx, parsed).await,
@@ -176,27 +175,33 @@ async fn dispatch(envelope: Envelope, ctx: &Arc<ControlContext>) -> Reply {
 /// that silently installs a dead endpoint is worse than a refused switch: the
 /// system proxy keeps pointing here and every request on the desktop fails.
 async fn apply_switch(ctx: &Arc<ControlContext>, endpoint: Endpoint) -> Reply {
-    let summary = endpoint
-        .webshare_user()
-        .map(|u| u.summary())
-        .unwrap_or_else(|| "no Webshare targeting".into());
     let redacted = endpoint.redacted();
-
     if let Err(e) = crate::upstream::probe(&endpoint).await {
         tracing::warn!("refusing switch to {redacted}: {e}");
         return Reply::Error {
             message: format!("{redacted} does not work, keeping the current upstream: {e}"),
         };
     }
-
     ctx.relay.upstream.set(endpoint.clone());
+    record_switch(ctx, endpoint)
+}
+
+/// Persist and describe an upstream that is already live. Used by paths that
+/// have proven the endpoint themselves.
+fn record_switch(ctx: &Arc<ControlContext>, endpoint: Endpoint) -> Reply {
+    let summary = endpoint
+        .webshare_user()
+        .map(|u| u.summary())
+        .unwrap_or_else(|| "no Webshare targeting".into());
+    let redacted = endpoint.redacted();
+
     if let Ok(mut state) = ctx.state.lock() {
         state.endpoint = endpoint;
         if let Err(e) = state.save() {
             tracing::warn!("could not persist switched endpoint: {e}");
         }
     }
-    tracing::info!("upstream switched to {redacted}");
+    tracing::info!("upstream now {redacted}");
 
     Reply::Switched {
         endpoint: redacted,

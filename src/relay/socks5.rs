@@ -8,7 +8,7 @@ use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{serve_tunnel, ExitPolicy, Relay};
+use super::{serve_tunnel, Dialer, ExitPolicy, Relay};
 use crate::upstream::{self, UpstreamError};
 
 const VERSION: u8 = 0x05;
@@ -110,7 +110,6 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
     reply(&mut client, REP_SUCCESS).await?;
 
     let target = format!("{host}:{port}");
-    let upstream = relay.upstream.clone();
     serve_tunnel(
         client,
         tunnel,
@@ -118,10 +117,10 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
         &target,
         Vec::new(),
         ExitPolicy::default(),
-        || {
-            let upstream = upstream.clone();
-            let host = host.clone();
-            async move { upstream::connect_through(&upstream.get(), &host, port).await }
+        Dialer::Tunnel {
+            upstream: relay.upstream.clone(),
+            host: host.into(),
+            port,
         },
     )
     .await;
