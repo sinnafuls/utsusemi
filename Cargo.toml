@@ -1,0 +1,45 @@
+[package]
+name = "utsusemi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Route your whole Windows desktop through a Webshare residential proxy"
+license = "MIT"
+repository = "https://github.com/sinnafuls/utsusemi"
+readme = "README.md"
+keywords = ["proxy", "webshare", "residential", "socks5", "windows"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "utsusemi"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "sync", "process"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = { version = "2", features = ["json", "socks-proxy", "tls"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinInet",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
