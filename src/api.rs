@@ -62,6 +62,8 @@ pub struct Subscription {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
     #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
     pub status: String,
     /// Bandwidth allowance in GB; `0` means unlimited.
     #[serde(default)]
@@ -87,6 +89,17 @@ impl Plan {
             format!("{} GB", self.bandwidth_limit)
         };
         format!("{kind}, {bandwidth}")
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.status == "active"
+    }
+
+    /// Rotating residential plans are the only ones that serve the 80M pool,
+    /// and they are reached through a username the proxy-list plan does not
+    /// share.
+    pub fn is_residential(&self) -> bool {
+        self.proxy_subtype == "residential"
     }
 }
 
@@ -202,29 +215,51 @@ impl Client {
         }
     }
 
+    /// Every plan on the account, active or not. `/subscription/` only ever
+    /// names one of them, so an account holding both a proxy-list plan and a
+    /// rotating residential plan is invisible without this.
+    pub fn plans(&self) -> Result<Vec<Plan>> {
+        let page: Page<Plan> = self.get("/subscription/plan/")?;
+        Ok(page.results)
+    }
+
+    /// Whether the account can reach the rotating residential pool.
+    pub fn has_active_residential(&self) -> Result<bool> {
+        Ok(self
+            .plans()?
+            .iter()
+            .any(|p| p.is_active() && p.is_residential()))
+    }
+
     /// Assemble a backbone endpoint from the account credentials plus the
     /// requested targeting. This is what makes `utsusemi connect --country de
-    /// --rotate` work with nothing pasted.
+    /// --rotate` work with nothing pasted. `residential` addresses the
+    /// rotating residential pool instead of the account's own proxy list.
     pub fn default_endpoint(
         &self,
         countries: &[String],
         geo: Option<Geo>,
         session: Session,
+        residential: bool,
     ) -> Result<Endpoint> {
         let config = self.proxy_config()?;
-        let username = WebshareUser {
+        let user = WebshareUser {
             base: config.username,
             countries: countries.iter().map(|c| c.to_ascii_lowercase()).collect(),
             geo,
             session,
-        }
-        .build();
+        };
+        let user = if residential {
+            user.to_residential()
+        } else {
+            user
+        };
 
         Ok(Endpoint {
             scheme: Scheme::Http,
             host: BACKBONE_HOST.to_string(),
             port: BACKBONE_HTTP_PORT,
-            username: Some(username),
+            username: Some(user.build()),
             password: Some(config.password),
         })
     }

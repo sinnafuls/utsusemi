@@ -138,6 +138,9 @@ struct Targeting {
     /// Keep one exit IP; pass an id to reuse a session, omit to generate one
     #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "auto")]
     sticky: Option<String>,
+    /// Use the rotating residential pool instead of your own proxy list
+    #[arg(long)]
+    residential: bool,
 }
 
 impl Targeting {
@@ -149,6 +152,7 @@ impl Targeting {
             && self.asn.is_none()
             && !self.rotate
             && self.sticky.is_none()
+            && !self.residential
     }
 
     fn geo(&self) -> Result<Option<Geo>> {
@@ -207,6 +211,9 @@ impl Targeting {
         match self.session() {
             Session::Default => {}
             other => user.session = other,
+        }
+        if self.residential {
+            user = user.to_residential();
         }
         Ok(endpoint.with_username(user.build()))
     }
@@ -334,35 +341,54 @@ fn auth_advice(endpoint: &Endpoint, config: &Config, runtime: &tokio::runtime::R
         return CREDENTIALS.to_string();
     };
 
-    if let Some(missing) = missing_countries(&user, config) {
-        return missing;
-    }
-
-    // Nothing conclusive from the account, so ask the backbone: retry with the
-    // targeting peeled back. Whichever variant is accepted names the parameter
-    // that was refused, and doubles as proof the credentials themselves work.
+    // Ask the backbone rather than guessing: retry the same credentials with
+    // the request rewritten, closest variant first. Whichever one is accepted
+    // names exactly what was refused, and proves the credentials themselves.
+    // The residential pool comes first because an account that holds both
+    // products keeps its geo coverage there, not in its own proxy list.
     let mut candidates: Vec<WebshareUser> = Vec::new();
+    let mut push = |candidate: WebshareUser| {
+        if candidate != user && !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    };
+    let residential = user.to_residential();
+    push(residential.clone());
+    push(WebshareUser {
+        geo: None,
+        session: Session::Rotate,
+        ..residential.clone()
+    });
+    push(WebshareUser {
+        countries: Vec::new(),
+        geo: None,
+        session: Session::Rotate,
+        ..residential
+    });
     for countries in [user.countries.clone(), Vec::new()] {
         for session in [Session::Rotate, Session::Default] {
-            let candidate = WebshareUser {
+            push(WebshareUser {
                 base: user.base.clone(),
                 countries: countries.clone(),
                 geo: None,
                 session,
-            };
-            if candidate != user && !candidates.contains(&candidate) {
-                candidates.push(candidate);
-            }
+            });
         }
     }
 
     for candidate in candidates {
         let probe = endpoint.with_username(candidate.build());
         if runtime.block_on(upstream::probe(&probe)).is_ok() {
+            let why = if candidate.is_residential() && !user.is_residential() {
+                "that targeting lives on your rotating residential plan, not in your own \
+                 proxy list"
+            } else {
+                "it is the targeting Webshare refuses — geo filters and sticky session ids \
+                 are only served on plans that carry them"
+            };
             return format!(
-                "\nThe username and password are fine: `{}` is accepted and `{}` is not, so it \
-                 is the targeting Webshare refuses — geo filters and sticky session ids are \
-                 only served on plans that carry them.\nReconnect with: utsusemi connect{}",
+                "\nThe username and password are fine: `{}` is accepted and `{}` is not, so {why}.\
+                 \nReconnect with: utsusemi connect{}",
                 candidate.build(),
                 user.build(),
                 targeting_flags(&candidate)
@@ -370,6 +396,9 @@ fn auth_advice(endpoint: &Endpoint, config: &Config, runtime: &tokio::runtime::R
         }
     }
 
+    if let Some(missing) = missing_countries(&user, config) {
+        return missing;
+    }
     CREDENTIALS.to_string()
 }
 
@@ -425,6 +454,9 @@ fn targeting_flags(user: &WebshareUser) -> String {
         Session::Sticky(id) => out.push_str(&format!(" --sticky {id}")),
         Session::Default => {}
     }
+    if user.is_residential() {
+        out.push_str(" --residential");
+    }
     out
 }
 
@@ -447,7 +479,12 @@ fn resolve_endpoint(
                 )
             })?;
             let endpoint = api::Client::new(key)
-                .default_endpoint(&targeting.countries, targeting.geo()?, targeting.session())
+                .default_endpoint(
+                    &targeting.countries,
+                    targeting.geo()?,
+                    targeting.session(),
+                    targeting.residential,
+                )
                 .context("building an endpoint from your Webshare account")?;
             (None, endpoint)
         }
@@ -506,6 +543,9 @@ fn spawn_detached(args: &ConnectArgs) -> Result<()> {
     }
     if let Some(v) = &args.targeting.sticky {
         cmd.arg("--sticky").arg(v);
+    }
+    if args.targeting.residential {
+        cmd.arg("--residential");
     }
     if args.socks5 {
         cmd.arg("--socks5");
@@ -1030,13 +1070,39 @@ fn cmd_account() -> Result<()> {
     let account = client.account()?;
     println!("Account      {}", account.email);
 
-    match client.proxy_config() {
-        Ok(cfg) => println!("Proxy user   {}", cfg.username),
-        Err(e) => println!("Proxy user   unavailable: {e}"),
-    }
-    match client.active_plan() {
-        Ok(Some(plan)) => println!("Plan         {}", plan.describe()),
-        Ok(None) => println!("Plan         free (no active plan)"),
+    let residential = match client.proxy_config() {
+        Ok(cfg) => {
+            println!("Proxy user   {}", cfg.username);
+            Some(cfg.username)
+        }
+        Err(e) => {
+            println!("Proxy user   unavailable: {e}");
+            None
+        }
+    };
+    // Every plan, not just the one the subscription names: accounts routinely
+    // hold a proxy-list plan and a rotating residential plan at once, and they
+    // are reached through different usernames.
+    match client.plans() {
+        Ok(plans) => {
+            let active: Vec<&api::Plan> = plans.iter().filter(|p| p.is_active()).collect();
+            if active.is_empty() {
+                println!("Plan         free (no active plan)");
+            }
+            for plan in &active {
+                println!("Plan         {}", plan.describe());
+            }
+            if let (Some(user), true) = (
+                residential.as_deref(),
+                active.iter().any(|p| p.is_residential()),
+            ) {
+                println!(
+                    "Residential  {}{}  (use --residential)",
+                    user,
+                    utsusemi::endpoint::RESIDENTIAL_SUFFIX
+                );
+            }
+        }
         Err(e) => println!("Plan         unavailable: {e}"),
     }
     match client.subscription() {
@@ -1071,6 +1137,7 @@ fn cmd_endpoint(targeting: Targeting, socks5: bool) -> Result<()> {
         &targeting.countries,
         targeting.geo()?,
         targeting.session(),
+        targeting.residential,
     )?;
     if socks5 {
         endpoint.scheme = Scheme::Socks5;

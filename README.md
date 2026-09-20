@@ -132,11 +132,27 @@ Webshare allows only one of city, state or zip at a time, and an ASN cannot be
 combined with a country. Utsusemi rejects those combinations before connecting
 rather than letting them silently do nothing.
 
-Country targeting only picks from the proxies your Webshare plan actually
-holds. Asking for a country that is not in your proxy list gets you a 407 from
-the backbone, so `connect` reports which countries your list does contain (it
-reads them from the API when you have a key stored) instead of leaving you with
-the bare rejection.
+Country targeting only picks from the proxies your plan actually holds, and
+Webshare keeps two of those per account:
+
+- **your proxy list** — the dedicated/shared proxies you bought, reached with
+  the plain username. Only the countries in that list work, and geo filters
+  beyond country are not served.
+- **the rotating residential pool** — 80 million IPs in ~195 countries, with
+  city, state, ZIP and ASN targeting. It has its own default username (your
+  proxy username with `residential` appended), so `--residential` is what
+  selects it:
+
+```
+utsusemi connect --country de --rotate --residential
+utsusemi connect --country us --city houston --rotate --residential
+utsusemi account                        which plans and usernames you have
+```
+
+Asking for a country your proxy list does not hold gets a bare 407 from the
+backbone. `connect` turns that into an answer: it retries the same credentials
+against the residential pool and with the targeting peeled back, then tells you
+which variant Webshare accepts and the exact flags to reconnect with.
 
 ### Rotating and sticky sessions
 

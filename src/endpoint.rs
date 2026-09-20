@@ -309,6 +309,14 @@ pub enum Session {
     Sticky(String),
 }
 
+/// Suffix Webshare appends to the account's proxy-list username to form the
+/// default username of a rotating residential plan (`qvogitwf` ->
+/// `qvogitwfresidential`). The API never returns it — the dashboard's endpoint
+/// generator emits it, and the backbone routes on it — so an account holding
+/// both products reaches the 80M residential pool only through this name,
+/// while the plain username stays pinned to the proxy list.
+pub const RESIDENTIAL_SUFFIX: &str = "residential";
+
 /// A parsed Webshare backbone username.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebshareUser {
@@ -398,7 +406,27 @@ impl WebshareUser {
             Session::Rotate => "rotating".to_string(),
             Session::Sticky(id) => format!("sticky #{id}"),
         });
+        bits.push(if self.is_residential() {
+            "residential pool".to_string()
+        } else {
+            "proxy list".to_string()
+        });
         bits.join(", ")
+    }
+
+    /// Whether this username addresses the rotating residential pool rather
+    /// than the account's own proxy list.
+    pub fn is_residential(&self) -> bool {
+        self.base.ends_with(RESIDENTIAL_SUFFIX)
+    }
+
+    /// The same targeting, addressed at the residential pool.
+    pub fn to_residential(&self) -> WebshareUser {
+        let mut out = self.clone();
+        if !out.is_residential() {
+            out.base.push_str(RESIDENTIAL_SUFFIX);
+        }
+        out
     }
 
     /// Fresh random sticky session id.
@@ -497,5 +525,19 @@ mod tests {
         let mut u = WebshareUser::parse("myuser-de-rotate");
         u.session = Session::Sticky("4242".into());
         assert_eq!(u.build(), "myuser-de-4242");
+    }
+
+    #[test]
+    fn residential_retarget_keeps_targeting_and_is_idempotent() {
+        let list = WebshareUser::parse("myuser-de-city_munich-rotate");
+        assert!(!list.is_residential());
+
+        let pool = list.to_residential();
+        assert_eq!(pool.build(), "myuserresidential-de-city_munich-rotate");
+        assert!(pool.is_residential());
+        assert_eq!(pool.countries, list.countries);
+        assert_eq!(pool.geo, list.geo);
+        assert_eq!(pool.session, list.session);
+        assert_eq!(pool.to_residential().build(), pool.build());
     }
 }
