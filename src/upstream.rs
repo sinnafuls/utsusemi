@@ -16,8 +16,18 @@ use tokio::net::TcpStream;
 
 use crate::endpoint::{Endpoint, Scheme};
 
-/// How long to wait for the upstream TCP connect and handshake.
+/// How long to wait for the TCP connect to the backbone itself.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long one exit gets to complete the proxy handshake. Short on purpose:
+/// a healthy Webshare exit answers CONNECT in well under a second, and a dead
+/// one never answers at all, so waiting is only ever wasted time.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many exits to try before giving up on a target. Residential exits are
+/// consumer machines and a few percent of them are black holes at any moment;
+/// on a rotating endpoint every fresh TCP connection lands on a different one,
+/// so retrying costs a round trip and fixes the stall the browser would
+/// otherwise show as a hung tab.
+const HANDSHAKE_ATTEMPTS: u32 = 3;
 /// Refuse absurd proxy response headers rather than buffering forever.
 const MAX_HEAD: usize = 16 * 1024;
 /// Target used to prove an upstream actually works before anything depends on
@@ -96,25 +106,48 @@ pub async fn dial_raw(upstream: &Endpoint) -> Result<TcpStream, UpstreamError> {
     Ok(stream)
 }
 
-/// Open a tunnel to `host:port` through `upstream`.
+/// Open a tunnel to `host:port` through `upstream`, retrying a stalled
+/// handshake on a fresh upstream connection.
 pub async fn connect_through(
     upstream: &Endpoint,
     host: &str,
     port: u16,
 ) -> Result<Tunnel, UpstreamError> {
-    let stream = dial_raw(upstream).await?;
+    connect_with_policy(upstream, host, port, HANDSHAKE_TIMEOUT, HANDSHAKE_ATTEMPTS).await
+}
 
-    let handshake = async {
-        match upstream.scheme {
-            Scheme::Http => http_connect(stream, upstream, host, port).await,
-            Scheme::Socks5 => socks5_connect(stream, upstream, host, port).await,
+async fn connect_with_policy(
+    upstream: &Endpoint,
+    host: &str,
+    port: u16,
+    handshake_timeout: Duration,
+    attempts: u32,
+) -> Result<Tunnel, UpstreamError> {
+    let mut attempt = 1;
+    loop {
+        let stream = dial_raw(upstream).await?;
+        let handshake = async {
+            match upstream.scheme {
+                Scheme::Http => http_connect(stream, upstream, host, port).await,
+                Scheme::Socks5 => socks5_connect(stream, upstream, host, port).await,
+            }
+        };
+
+        match tokio::time::timeout(handshake_timeout, handshake).await {
+            Ok(result) => return result,
+            Err(_) if attempt < attempts => {
+                tracing::debug!("exit stalled on {host}:{port}, retrying ({attempt}/{attempts})");
+                attempt += 1;
+            }
+            Err(_) => {
+                return Err(UpstreamError::Protocol(format!(
+                    "no upstream exit completed the handshake to {host}:{port} \
+                     ({attempts} tried, {}s each)",
+                    handshake_timeout.as_secs_f32()
+                )))
+            }
         }
-    };
-    tokio::time::timeout(CONNECT_TIMEOUT, handshake)
-        .await
-        .map_err(|_| {
-            UpstreamError::Protocol("upstream proxy handshake timed out after 15s".into())
-        })?
+    }
 }
 
 /// Prove the upstream is usable: full dial plus handshake to a known-good
@@ -471,5 +504,69 @@ mod tests {
     #[test]
     fn socks_reply_codes_are_named() {
         assert_eq!(socks_reply_reason(0x05), "connection refused");
+    }
+
+    /// A backbone stand-in: the first `stall` connections read the CONNECT
+    /// head and then go silent, exactly like a dead residential exit; the one
+    /// after that answers. Returns its address and a counter of connections.
+    fn stalling_backbone(stall: usize) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+
+        std::thread::spawn(move || {
+            // Held open so a stalled connection stays stalled instead of
+            // closing and turning the test into an error path.
+            let mut parked = Vec::new();
+            for stream in listener.incoming() {
+                use std::io::{Read, Write};
+                let Ok(mut stream) = stream else { return };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                if n < stall {
+                    parked.push(stream);
+                    continue;
+                }
+                let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+                let _ = stream.flush();
+                parked.push(stream);
+            }
+        });
+
+        (addr, seen)
+    }
+
+    #[tokio::test]
+    async fn a_stalled_exit_is_retried_on_a_fresh_connection() {
+        use std::sync::atomic::Ordering;
+
+        let (addr, seen) = stalling_backbone(2);
+        let endpoint: Endpoint = addr.parse().expect("endpoint");
+
+        let tunnel =
+            connect_with_policy(&endpoint, "example.com", 443, Duration::from_millis(150), 3).await;
+
+        assert!(tunnel.is_ok(), "third exit answers: {:?}", tunnel.err());
+        assert_eq!(seen.load(Ordering::SeqCst), 3, "one connection per attempt");
+    }
+
+    #[tokio::test]
+    async fn every_exit_stalling_reports_the_attempts() {
+        let (addr, _) = stalling_backbone(usize::MAX);
+        let endpoint: Endpoint = addr.parse().expect("endpoint");
+
+        let result =
+            connect_with_policy(&endpoint, "example.com", 443, Duration::from_millis(100), 3).await;
+
+        let text = match result {
+            Ok(_) => panic!("a backbone that never answers must not yield a tunnel"),
+            Err(e) => e.to_string(),
+        };
+        assert!(text.contains("example.com:443"), "{text}");
+        assert!(text.contains("3 tried"), "{text}");
     }
 }

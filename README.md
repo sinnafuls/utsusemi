@@ -239,6 +239,12 @@ Hostnames are passed through CONNECT and SOCKS5 untouched. If they were
 resolved locally your real location would leak and geo targeting would be
 pointless.
 
+Residential exits are consumer machines, and a small share of them are black
+holes at any moment: the CONNECT is accepted by the backbone and then nothing
+comes back. Each tunnel therefore gets 5 seconds per exit and up to three
+exits; on a rotating endpoint every retry lands on a different IP, so a dead
+exit costs a few seconds rather than a hung tab.
+
 ## How it treats your Windows settings
 
 Utsusemi writes to `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`.
