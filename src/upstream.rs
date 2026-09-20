@@ -30,11 +30,20 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_ATTEMPTS: u32 = 3;
 /// Refuse absurd proxy response headers rather than buffering forever.
 const MAX_HEAD: usize = 16 * 1024;
+/// How long an exit gets to produce its first byte of payload once the tunnel
+/// is open. The Webshare gateway answers CONNECT itself, before the exit has
+/// proven it can reach anything, so an accepted tunnel means nothing: a dead
+/// exit looks exactly like a live idle one until this expires. Healthy exits
+/// measured at 0.3-1.7s, so four seconds writes off the dead without writing
+/// off the slow.
+pub const EXIT_REPLY_TIMEOUT: Duration = Duration::from_secs(4);
 /// Target used to prove an upstream actually works before anything depends on
-/// it. Webshare's own echo host: reachable from every exit, and a 407 here is
-/// unambiguous.
+/// it: Webshare's own echo host, on the port real traffic uses.
 const PROBE_HOST: &str = "ipv4.webshare.io";
 const PROBE_PORT: u16 = 443;
+/// Exits the check may burn before calling the upstream unusable. The pool is
+/// never uniformly healthy, so one silent exit is noise and three is a fact.
+const PROBE_EXITS: u32 = 3;
 
 /// Hot-swappable upstream. `switch`/`rotate` replace it while the relay keeps
 /// listening, so existing sockets drain on the old exit and new connections
@@ -150,15 +159,56 @@ async fn connect_with_policy(
     }
 }
 
-/// Prove the upstream is usable: full dial plus handshake to a known-good
-/// target, then throw the tunnel away. Called before anything (the Windows
-/// system proxy, a live switch) starts depending on the endpoint, because a
-/// bad endpoint otherwise only shows up as every request in the desktop
-/// failing.
+/// Prove the upstream can actually carry traffic, not merely open a tunnel.
+///
+/// Called before anything (the Windows system proxy, a live switch) starts
+/// depending on the endpoint. It goes to port 443, because that is what every
+/// browser, Discord and Spotify connection uses, and a residential pool whose
+/// exits cannot reach 443 leaves the desktop dead while port 80 still works.
+/// A plaintext line into the TLS port is enough: a reachable server answers
+/// with an error, a black-holed exit answers with nothing.
 pub async fn probe(upstream: &Endpoint) -> Result<(), UpstreamError> {
-    connect_through(upstream, PROBE_HOST, PROBE_PORT)
+    let mut last = String::new();
+    for _ in 0..PROBE_EXITS {
+        match probe_once(upstream).await {
+            Ok(()) => return Ok(()),
+            // Credentials and refusals are the same on every exit; only
+            // silence is worth another try.
+            Err(e @ (UpstreamError::Auth { .. } | UpstreamError::Refused { .. })) => return Err(e),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(UpstreamError::Protocol(format!(
+        "{PROBE_EXITS} exits tried, none carried traffic to port 443: {last}"
+    )))
+}
+
+async fn probe_once(upstream: &Endpoint) -> Result<(), UpstreamError> {
+    let mut tunnel = connect_through(upstream, PROBE_HOST, PROBE_PORT).await?;
+    if !tunnel.prelude.is_empty() {
+        return Ok(());
+    }
+
+    let request = format!("GET / HTTP/1.1\r\nHost: {PROBE_HOST}\r\nConnection: close\r\n\r\n");
+    tunnel.stream.write_all(request.as_bytes()).await?;
+    tunnel.stream.flush().await?;
+
+    let mut buf = [0u8; 256];
+    let read = tokio::time::timeout(EXIT_REPLY_TIMEOUT, tunnel.stream.read(&mut buf))
         .await
-        .map(drop)
+        .map_err(|_| {
+            UpstreamError::Protocol(format!(
+                "the exit accepted a tunnel to {PROBE_HOST}:{PROBE_PORT} and then sent \
+                 nothing for {}s",
+                EXIT_REPLY_TIMEOUT.as_secs()
+            ))
+        })??;
+    if read == 0 {
+        return Err(UpstreamError::Protocol(
+            "the exit closed the tunnel without replying".into(),
+        ));
+    }
+    Ok(())
 }
 
 // HTTP CONNECT

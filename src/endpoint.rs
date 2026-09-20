@@ -310,11 +310,13 @@ pub enum Session {
 }
 
 /// Suffix Webshare appends to the account's proxy-list username to form the
-/// default username of a rotating residential plan (`qvogitwf` ->
-/// `qvogitwfresidential`). The API never returns it — the dashboard's endpoint
-/// generator emits it, and the backbone routes on it — so an account holding
-/// both products reaches the 80M residential pool only through this name,
-/// while the plain username stays pinned to the proxy list.
+/// username of a rotating residential plan (`qvogitwf` ->
+/// `qvogitwfresidential`). `/proxy/config/` does not report it, but
+/// `/proxy/list/?mode=backbone&plan_id=<residential plan>` returns entries
+/// named `<username>residential-<CC>-<n>`, which is also what Webshare's own
+/// browser extension connects with. An account holding both products reaches
+/// the residential pool only through this name; the plain username stays
+/// pinned to its proxy list.
 pub const RESIDENTIAL_SUFFIX: &str = "residential";
 
 /// A parsed Webshare backbone username.

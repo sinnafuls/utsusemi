@@ -1,3 +1,4 @@
 /target
 # Local sandbox used when RESD_HOME points into the repo; holds credentials.
 /.smoke
+/reference

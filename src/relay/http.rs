@@ -7,7 +7,7 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{splice, Relay};
+use super::{serve_tunnel, ExitPolicy, Relay};
 use crate::endpoint::Scheme;
 use crate::upstream::{self, split_authority, Tunnel, UpstreamError};
 
@@ -80,10 +80,26 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
         client
             .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
             .await?;
+
         // Anything the client pipelined after the CONNECT head belongs to the
-        // tunnel; push it upstream before splicing.
-        let tunnel = prime(tunnel, &body_prefix).await?;
-        splice(client, tunnel, relay.stats.clone()).await;
+        // tunnel, and doubles as the payload replayed if this exit turns out
+        // to be a black hole.
+        let target = format!("{host}:{port}");
+        let upstream = relay.upstream.clone();
+        serve_tunnel(
+            client,
+            tunnel,
+            relay.stats.clone(),
+            &target,
+            body_prefix,
+            ExitPolicy::default(),
+            || {
+                let upstream = upstream.clone();
+                let host = host.clone();
+                async move { upstream::connect_through(&upstream.get(), &host, port).await }
+            },
+        )
+        .await;
         return Ok(());
     }
 
@@ -145,24 +161,39 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
         }
     };
 
-    let mut tunnel = tunnel;
-    tunnel.stream.write_all(head_out.as_bytes()).await?;
-    if !body_prefix.is_empty() {
-        tunnel.stream.write_all(&body_prefix).await?;
-    }
-    tunnel.stream.flush().await?;
+    let mut payload = head_out.into_bytes();
+    payload.extend_from_slice(&body_prefix);
 
-    splice(client, tunnel, relay.stats.clone()).await;
+    let target = format!("{host}:{port}");
+    let upstream = relay.upstream.clone();
+    let scheme = upstream_endpoint.scheme;
+    serve_tunnel(
+        client,
+        tunnel,
+        relay.stats.clone(),
+        &target,
+        payload,
+        ExitPolicy::default(),
+        || {
+            let upstream = upstream.clone();
+            let host = host.clone();
+            async move {
+                let endpoint = upstream.get();
+                match scheme {
+                    // The replayed payload is the whole absolute-form request,
+                    // so a raw connection to the backbone is all that is
+                    // needed; only SOCKS5 has to redo a handshake.
+                    Scheme::Http => upstream::dial_raw(&endpoint).await.map(|stream| Tunnel {
+                        stream,
+                        prelude: Vec::new(),
+                    }),
+                    Scheme::Socks5 => upstream::connect_through(&endpoint, &host, port).await,
+                }
+            }
+        },
+    )
+    .await;
     Ok(())
-}
-
-/// Forward pipelined bytes that arrived with the CONNECT head.
-async fn prime(mut tunnel: Tunnel, body_prefix: &[u8]) -> std::io::Result<Tunnel> {
-    if !body_prefix.is_empty() {
-        tunnel.stream.write_all(body_prefix).await?;
-        tunnel.stream.flush().await?;
-    }
-    Ok(tunnel)
 }
 
 /// Read the request head, returning it plus any bytes that followed it.
