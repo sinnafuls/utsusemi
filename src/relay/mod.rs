@@ -4,7 +4,8 @@ pub mod http;
 pub mod socks5;
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -23,31 +24,54 @@ pub struct Stats {
     pub failed: AtomicU64,
     pub up_bytes: AtomicU64,
     pub down_bytes: AtomicU64,
+    /// Why the most recent attempt failed, and when. A bare failure count
+    /// cannot distinguish "one client spoke garbage" from "every request is
+    /// being rejected by the upstream", which is exactly the case where the
+    /// desktop looks broken and nothing says why.
+    last_failure: Mutex<Option<(String, Instant)>>,
 }
 
 impl Stats {
     pub fn snapshot(&self) -> StatsSnapshot {
+        let (last_failure, last_failure_secs_ago) = match self.last_failure() {
+            Some((msg, at)) => (Some(msg), Some(at.elapsed().as_secs())),
+            None => (None, None),
+        };
         StatsSnapshot {
             active: self.active.load(Ordering::Relaxed),
             total: self.total.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             up_bytes: self.up_bytes.load(Ordering::Relaxed),
             down_bytes: self.down_bytes.load(Ordering::Relaxed),
+            last_failure,
+            last_failure_secs_ago,
         }
     }
 
-    pub fn fail(&self) {
+    /// Count a connection that never reached the splice, and keep why.
+    pub fn fail(&self, reason: impl Into<String>) {
         self.failed.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut slot) = self.last_failure.lock() {
+            *slot = Some((reason.into(), Instant::now()));
+        }
+    }
+
+    fn last_failure(&self) -> Option<(String, Instant)> {
+        self.last_failure.lock().ok()?.clone()
     }
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatsSnapshot {
     pub active: u64,
     pub total: u64,
     pub failed: u64,
     pub up_bytes: u64,
     pub down_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_secs_ago: Option<u64>,
 }
 
 /// Keeps `active` honest: decrements on every exit path, including panics.

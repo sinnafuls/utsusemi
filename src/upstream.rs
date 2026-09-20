@@ -20,6 +20,11 @@ use crate::endpoint::{Endpoint, Scheme};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Refuse absurd proxy response headers rather than buffering forever.
 const MAX_HEAD: usize = 16 * 1024;
+/// Target used to prove an upstream actually works before anything depends on
+/// it. Webshare's own echo host: reachable from every exit, and a 407 here is
+/// unambiguous.
+const PROBE_HOST: &str = "ipv4.webshare.io";
+const PROBE_PORT: u16 = 443;
 
 /// Hot-swappable upstream. `switch`/`rotate` replace it while the relay keeps
 /// listening, so existing sockets drain on the old exit and new connections
@@ -49,8 +54,13 @@ pub enum UpstreamError {
         #[source]
         source: std::io::Error,
     },
-    #[error("upstream proxy rejected the credentials")]
-    Auth,
+    #[error("upstream proxy rejected the credentials{}", .reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default())]
+    Auth {
+        /// What the proxy said, when it said anything. Webshare puts the real
+        /// cause in the `Proxy-Authenticate` realm: bad password and "that
+        /// country is not in your proxy list" both arrive as a bare 407.
+        reason: Option<String>,
+    },
     #[error("upstream proxy refused target {target}: {reason}")]
     Refused { target: String, reason: String },
     #[error("upstream protocol error: {0}")]
@@ -107,6 +117,17 @@ pub async fn connect_through(
         })?
 }
 
+/// Prove the upstream is usable: full dial plus handshake to a known-good
+/// target, then throw the tunnel away. Called before anything (the Windows
+/// system proxy, a live switch) starts depending on the endpoint, because a
+/// bad endpoint otherwise only shows up as every request in the desktop
+/// failing.
+pub async fn probe(upstream: &Endpoint) -> Result<(), UpstreamError> {
+    connect_through(upstream, PROBE_HOST, PROBE_PORT)
+        .await
+        .map(drop)
+}
+
 // HTTP CONNECT
 
 async fn http_connect(
@@ -140,12 +161,26 @@ async fn http_connect(
 
     match status {
         200..=299 => Ok(Tunnel { stream, prelude }),
-        407 => Err(UpstreamError::Auth),
+        407 => Err(UpstreamError::Auth {
+            reason: auth_reason(&head),
+        }),
         _ => Err(UpstreamError::Refused {
             target,
             reason: status_line.trim().to_string(),
         }),
     }
+}
+
+/// Pull the realm out of `Proxy-Authenticate: Basic realm="..."`. Webshare
+/// states the actual reason there ("The proxy you are connecting is not in
+/// your list."), while the body is always the same generic sentence.
+fn auth_reason(head: &str) -> Option<String> {
+    let line = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("proxy-authenticate:"))?;
+    let realm = line.split_once("realm=")?.1.trim();
+    let realm = realm.trim_matches('"').trim();
+    (!realm.is_empty()).then(|| realm.to_string())
 }
 
 /// Read up to and including `\r\n\r\n`, returning the head and any bytes that
@@ -215,10 +250,18 @@ async fn socks5_connect(
     match reply[1] {
         0x00 => {}
         0x02 => {
-            let (user, pass) = credentials.ok_or(UpstreamError::Auth)?;
+            let (user, pass) = credentials.ok_or_else(|| UpstreamError::Auth {
+                reason: Some(
+                    "upstream demands a username and password, but the endpoint has none".into(),
+                ),
+            })?;
             username_password_auth(&mut stream, user, pass).await?;
         }
-        0xFF => return Err(UpstreamError::Auth),
+        0xFF => {
+            return Err(UpstreamError::Auth {
+                reason: Some("upstream rejected every offered SOCKS5 auth method".into()),
+            })
+        }
         other => {
             return Err(UpstreamError::Protocol(format!(
                 "upstream selected unsupported SOCKS5 auth method {other:#04x}"
@@ -268,7 +311,11 @@ async fn socks5_connect(
         // Drain the bound address so the error path does not desync anything.
         let _ = read_socks_addr(&mut stream, head[3]).await;
         return Err(match head[1] {
-            0x02 => UpstreamError::Auth,
+            0x02 => UpstreamError::Auth {
+                reason: Some(format!(
+                    "not allowed to reach {target} with these credentials"
+                )),
+            },
             code => UpstreamError::Refused {
                 target,
                 reason: socks_reply_reason(code).to_string(),
@@ -305,7 +352,12 @@ async fn username_password_auth(
     let mut reply = [0u8; 2];
     stream.read_exact(&mut reply).await?;
     if reply[1] != 0x00 {
-        return Err(UpstreamError::Auth);
+        return Err(UpstreamError::Auth {
+            reason: Some(format!(
+                "username/password rejected (status {:#04x})",
+                reply[1]
+            )),
+        });
     }
     Ok(())
 }
@@ -382,6 +434,25 @@ mod tests {
     fn finds_header_terminator() {
         assert_eq!(find_header_end(b"HTTP/1.1 200 OK\r\n\r\n"), Some(19));
         assert_eq!(find_header_end(b"HTTP/1.1 200 OK\r\n"), None);
+    }
+
+    #[test]
+    fn extracts_the_reason_webshare_puts_in_the_407_realm() {
+        let head = "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                    Proxy-Authenticate: Basic realm=\"The proxy you are connecting is not in your list.\"\r\n\
+                    Content-Length: 121\r\n\r\n";
+        assert_eq!(
+            auth_reason(head).as_deref(),
+            Some("The proxy you are connecting is not in your list.")
+        );
+        assert_eq!(
+            auth_reason("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            auth_reason("HTTP/1.1 407 x\r\nproxy-authenticate: Basic realm=\"\"\r\n\r\n"),
+            None
+        );
     }
 
     #[test]

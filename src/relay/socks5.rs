@@ -49,7 +49,10 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
     let mut prefix = [0u8; 2];
     client.read_exact(&mut prefix).await?;
     if prefix[0] != VERSION {
-        relay.stats.fail();
+        relay.stats.fail(format!(
+            "client on the SOCKS5 port does not speak SOCKS5 (version byte {:#04x})",
+            prefix[0]
+        ));
         // Not SOCKS5. Most often a browser pointed at the wrong port.
         return Ok(());
     }
@@ -57,7 +60,9 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
     client.read_exact(&mut methods).await?;
     if !methods.contains(&0x00) {
         client.write_all(&[VERSION, 0xFF]).await?;
-        relay.stats.fail();
+        relay
+            .stats
+            .fail("client offered no SOCKS5 auth method this listener accepts");
         return Ok(());
     }
     client.write_all(&[VERSION, 0x00]).await?;
@@ -66,20 +71,25 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
     let mut head = [0u8; 4];
     client.read_exact(&mut head).await?;
     if head[0] != VERSION {
-        relay.stats.fail();
+        relay
+            .stats
+            .fail(format!("bad SOCKS5 request version {:#04x}", head[0]));
         return Ok(());
     }
     let (host, port) = match read_target(&mut client, head[3]).await {
         Ok(target) => target,
         Err(e) => {
-            relay.stats.fail();
+            relay.stats.fail(format!("unreadable SOCKS5 target: {e}"));
             let _ = reply(&mut client, REP_GENERAL_FAILURE).await;
             return Err(e);
         }
     };
     if head[1] != CMD_CONNECT {
         // BIND and UDP ASSOCIATE cannot be relayed through an HTTP backbone.
-        relay.stats.fail();
+        relay.stats.fail(format!(
+            "SOCKS5 command {:#04x} is not supported; only CONNECT is relayed",
+            head[1]
+        ));
         reply(&mut client, REP_CMD_NOT_SUPPORTED).await?;
         return Ok(());
     }
@@ -88,7 +98,9 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
     let tunnel = match upstream::connect_through(&upstream_endpoint, &host, port).await {
         Ok(t) => t,
         Err(e) => {
-            relay.stats.fail();
+            relay
+                .stats
+                .fail(format!("socks5 connect {host}:{port}: {e}"));
             tracing::warn!("socks5 connect {host}:{port} failed: {e}");
             reply(&mut client, reply_code(&e)).await?;
             return Ok(());
@@ -142,7 +154,7 @@ fn reply_code(e: &UpstreamError) -> u8 {
         UpstreamError::Dial { .. } => REP_HOST_UNREACHABLE,
         // There is no SOCKS5 code for "the proxy rejected *our* credentials",
         // so the client sees a general failure and the reason goes to the log.
-        UpstreamError::Auth => REP_GENERAL_FAILURE,
+        UpstreamError::Auth { .. } => REP_GENERAL_FAILURE,
         _ => REP_GENERAL_FAILURE,
     }
 }

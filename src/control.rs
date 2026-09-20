@@ -95,7 +95,7 @@ async fn handle(socket: tokio::net::TcpStream, ctx: Arc<ControlContext>) -> Resu
             continue;
         }
         let reply = match serde_json::from_str::<Envelope>(&line) {
-            Ok(envelope) => dispatch(envelope, &ctx),
+            Ok(envelope) => dispatch(envelope, &ctx).await,
             Err(e) => Reply::Error {
                 message: format!("malformed request: {e}"),
             },
@@ -108,7 +108,7 @@ async fn handle(socket: tokio::net::TcpStream, ctx: Arc<ControlContext>) -> Resu
     Ok(())
 }
 
-fn dispatch(envelope: Envelope, ctx: &Arc<ControlContext>) -> Reply {
+async fn dispatch(envelope: Envelope, ctx: &Arc<ControlContext>) -> Reply {
     {
         let state = match ctx.state.lock() {
             Ok(s) => s,
@@ -161,10 +161,10 @@ fn dispatch(envelope: Envelope, ctx: &Arc<ControlContext>) -> Reply {
                 _ => Session::Sticky(WebshareUser::new_sticky_id()),
             };
             let updated = current.with_username(user.build());
-            apply_switch(ctx, updated)
+            apply_switch(ctx, updated).await
         }
         Request::Switch { endpoint } => match endpoint.parse::<Endpoint>() {
-            Ok(parsed) => apply_switch(ctx, parsed),
+            Ok(parsed) => apply_switch(ctx, parsed).await,
             Err(e) => Reply::Error {
                 message: format!("invalid endpoint: {e}"),
             },
@@ -172,12 +172,22 @@ fn dispatch(envelope: Envelope, ctx: &Arc<ControlContext>) -> Reply {
     }
 }
 
-fn apply_switch(ctx: &Arc<ControlContext>, endpoint: Endpoint) -> Reply {
+/// Swap the live upstream, but only after proving the new one works. A switch
+/// that silently installs a dead endpoint is worse than a refused switch: the
+/// system proxy keeps pointing here and every request on the desktop fails.
+async fn apply_switch(ctx: &Arc<ControlContext>, endpoint: Endpoint) -> Reply {
     let summary = endpoint
         .webshare_user()
         .map(|u| u.summary())
         .unwrap_or_else(|| "no Webshare targeting".into());
     let redacted = endpoint.redacted();
+
+    if let Err(e) = crate::upstream::probe(&endpoint).await {
+        tracing::warn!("refusing switch to {redacted}: {e}");
+        return Reply::Error {
+            message: format!("{redacted} does not work, keeping the current upstream: {e}"),
+        };
+    }
 
     ctx.relay.upstream.set(endpoint.clone());
     if let Ok(mut state) = ctx.state.lock() {

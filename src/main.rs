@@ -14,7 +14,7 @@ use utsusemi::control::{self, ControlContext, Reply, Request};
 use utsusemi::endpoint::{Endpoint, Geo, Scheme, Session, WebshareUser};
 use utsusemi::relay::{self, Relay};
 use utsusemi::state::{self, RunState};
-use utsusemi::upstream::UpstreamHandle;
+use utsusemi::upstream::{self, UpstreamError, UpstreamHandle};
 use utsusemi::{api, ipcheck, sysproxy};
 
 /// Set on the detached child so it knows to run the relay instead of
@@ -281,10 +281,151 @@ fn cmd_connect(args: ConnectArgs) -> Result<()> {
         println!("Targeting {}", user.summary());
     }
 
+    preflight(&endpoint, &config)?;
+
     if args.foreground {
         return run_daemon(args, config);
     }
     spawn_detached(&args)
+}
+
+/// Prove the upstream works before the Windows system proxy is pointed at us.
+/// Without this, a bad endpoint produces a "Connected." message and a desktop
+/// where every single request fails.
+fn preflight(endpoint: &Endpoint, config: &Config) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?;
+
+    // One retry: the residential backbone drops the occasional handshake, and
+    // refusing to connect over a single blip would be worse than the bug this
+    // check exists to catch.
+    let mut last = match runtime.block_on(upstream::probe(endpoint)) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if !matches!(last, UpstreamError::Auth { .. }) {
+        std::thread::sleep(Duration::from_millis(500));
+        match runtime.block_on(upstream::probe(endpoint)) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+
+    let mut message = format!("the upstream proxy is not usable: {last}");
+    if let UpstreamError::Auth { .. } = last {
+        message.push_str(&auth_advice(endpoint, config, &runtime));
+    }
+    message.push_str("\nNothing was changed: the system proxy is untouched.");
+    bail!("{message}")
+}
+
+/// A 407 on a Webshare backbone username is far more often targeting than a
+/// typo: the country filter only picks from the proxies the plan actually
+/// holds, and session parameters are plan-dependent too. Both are answerable
+/// here — the account lists its countries, and the credentials can be retried
+/// with the targeting stripped back — so answer them instead of leaving the
+/// user with a bare rejection.
+fn auth_advice(endpoint: &Endpoint, config: &Config, runtime: &tokio::runtime::Runtime) -> String {
+    const CREDENTIALS: &str = "\nCheck the username and password on the endpoint.";
+
+    let Some(user) = endpoint.webshare_user() else {
+        return CREDENTIALS.to_string();
+    };
+
+    if let Some(missing) = missing_countries(&user, config) {
+        return missing;
+    }
+
+    // Nothing conclusive from the account, so ask the backbone: retry with the
+    // targeting peeled back. Whichever variant is accepted names the parameter
+    // that was refused, and doubles as proof the credentials themselves work.
+    let mut candidates: Vec<WebshareUser> = Vec::new();
+    for countries in [user.countries.clone(), Vec::new()] {
+        for session in [Session::Rotate, Session::Default] {
+            let candidate = WebshareUser {
+                base: user.base.clone(),
+                countries: countries.clone(),
+                geo: None,
+                session,
+            };
+            if candidate != user && !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    for candidate in candidates {
+        let probe = endpoint.with_username(candidate.build());
+        if runtime.block_on(upstream::probe(&probe)).is_ok() {
+            return format!(
+                "\nThe username and password are fine: `{}` is accepted and `{}` is not, so it \
+                 is the targeting Webshare refuses — geo filters and sticky session ids are \
+                 only served on plans that carry them.\nReconnect with: utsusemi connect{}",
+                candidate.build(),
+                user.build(),
+                targeting_flags(&candidate)
+            );
+        }
+    }
+
+    CREDENTIALS.to_string()
+}
+
+/// Countries asked for that the account's proxy list does not contain, phrased
+/// as advice. `None` when there is nothing to say: no API key, no country
+/// targeting, or a list that does cover the request.
+fn missing_countries(user: &WebshareUser, config: &Config) -> Option<String> {
+    if user.countries.is_empty() {
+        return None;
+    }
+    let listed = config
+        .api_key
+        .as_deref()
+        .and_then(|key| api::Client::new(key).proxy_countries().ok())
+        .filter(|c| !c.is_empty())?;
+
+    let missing: Vec<&str> = user
+        .countries
+        .iter()
+        .filter(|c| !listed.contains_key(&c.to_ascii_uppercase()))
+        .map(|c| c.as_str())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+
+    let have: Vec<String> = listed
+        .iter()
+        .map(|(code, count)| format!("{} ({count})", code.to_ascii_lowercase()))
+        .collect();
+    Some(format!(
+        "\nYour Webshare proxy list has no {} proxies. It contains: {}.\n\
+         Target one of those (`--country {}`), or replace proxies in the dashboard \
+         so the country you want is in the list.",
+        missing.join("+"),
+        have.join(", "),
+        listed
+            .keys()
+            .next()
+            .map(|c| c.to_ascii_lowercase())
+            .unwrap_or_default()
+    ))
+}
+
+/// The `connect` flags that reproduce a username's targeting.
+fn targeting_flags(user: &WebshareUser) -> String {
+    let mut out = String::new();
+    for c in &user.countries {
+        out.push_str(&format!(" --country {c}"));
+    }
+    match &user.session {
+        Session::Rotate => out.push_str(" --rotate"),
+        Session::Sticky(id) => out.push_str(&format!(" --sticky {id}")),
+        Session::Default => {}
+    }
+    out
 }
 
 /// Work out which upstream to use, from the strongest source available:
@@ -689,6 +830,13 @@ fn cmd_status(json: bool) -> Result<()> {
         format_bytes(s.up_bytes),
         format_bytes(s.down_bytes)
     );
+    if let Some(reason) = &s.last_failure {
+        let age = s
+            .last_failure_secs_ago
+            .map(|secs| format!(" ({} ago)", format_duration(secs)))
+            .unwrap_or_default();
+        println!("Last failure {reason}{age}");
+    }
     Ok(())
 }
 

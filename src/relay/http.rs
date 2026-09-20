@@ -44,7 +44,9 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
     };
 
     let Some(request) = Request::parse(&head) else {
-        relay.stats.fail();
+        relay
+            .stats
+            .fail("client sent something that is not an HTTP proxy request");
         return respond(
             &mut client,
             400,
@@ -59,14 +61,16 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
 
     if request.method.eq_ignore_ascii_case("CONNECT") {
         let Some((host, port)) = split_authority(&request.target, 443) else {
-            relay.stats.fail();
+            relay
+                .stats
+                .fail(format!("malformed CONNECT target `{}`", request.target));
             return respond(&mut client, 400, "Bad Request", "Malformed CONNECT target.\n").await;
         };
 
         let tunnel = match upstream::connect_through(&upstream_endpoint, &host, port).await {
             Ok(t) => t,
             Err(e) => {
-                relay.stats.fail();
+                relay.stats.fail(format!("CONNECT {host}:{port}: {e}"));
                 tracing::warn!("CONNECT {host}:{port} failed: {e}");
                 let (code, reason) = status_for(&e);
                 return respond(&mut client, code, reason, &explain(&e)).await;
@@ -85,7 +89,10 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
 
     // Absolute-form plain HTTP: GET http://host/path HTTP/1.1
     let Some((host, port, path)) = parse_absolute_uri(&request.target) else {
-        relay.stats.fail();
+        relay.stats.fail(format!(
+            "request target `{}` is neither CONNECT nor absolute-form",
+            request.target
+        ));
         return respond(
             &mut client,
             400,
@@ -104,7 +111,9 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
             let stream = match upstream::dial_raw(&upstream_endpoint).await {
                 Ok(s) => s,
                 Err(e) => {
-                    relay.stats.fail();
+                    relay
+                        .stats
+                        .fail(format!("upstream dial for {host}:{port}: {e}"));
                     tracing::warn!("upstream dial for {host}:{port} failed: {e}");
                     let (code, reason) = status_for(&e);
                     return respond(&mut client, code, reason, &explain(&e)).await;
@@ -126,7 +135,7 @@ async fn handle(mut client: TcpStream, relay: Relay) -> std::io::Result<()> {
             let tunnel = match upstream::connect_through(&upstream_endpoint, &host, port).await {
                 Ok(t) => t,
                 Err(e) => {
-                    relay.stats.fail();
+                    relay.stats.fail(format!("tunnel to {host}:{port}: {e}"));
                     tracing::warn!("tunnel to {host}:{port} failed: {e}");
                     let (code, reason) = status_for(&e);
                     return respond(&mut client, code, reason, &explain(&e)).await;
@@ -254,7 +263,7 @@ fn parse_absolute_uri(target: &str) -> Option<(String, u16, String)> {
 
 fn status_for(e: &UpstreamError) -> (u16, &'static str) {
     match e {
-        UpstreamError::Auth => (502, "Bad Gateway"),
+        UpstreamError::Auth { .. } => (502, "Bad Gateway"),
         UpstreamError::Dial { .. } => (502, "Bad Gateway"),
         UpstreamError::Refused { .. } => (502, "Bad Gateway"),
         UpstreamError::Protocol(_) => (502, "Bad Gateway"),
@@ -266,10 +275,16 @@ fn status_for(e: &UpstreamError) -> (u16, &'static str) {
 /// immediately knows what to do about.
 fn explain(e: &UpstreamError) -> String {
     match e {
-        UpstreamError::Auth => "Webshare rejected the proxy credentials.\n\
-             Check the username and password in your endpoint, then reconnect:\n\
-             utsusemi disconnect && utsusemi connect \"<endpoint>\"\n"
-            .to_string(),
+        UpstreamError::Auth { reason } => format!(
+            "Webshare rejected the proxy credentials{}\n\
+             Check the endpoint's username and password, and that the country \
+             you are targeting exists in your proxy list:\n\
+             utsusemi status && utsusemi connect --country <code>\n",
+            match reason {
+                Some(r) => format!(": {r}"),
+                None => ".".to_string(),
+            }
+        ),
         UpstreamError::Dial { addr, source } => format!(
             "Could not reach the Webshare backbone at {addr}: {source}\n\
              Check your internet connection, or try the gateway IP if your \

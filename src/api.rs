@@ -4,6 +4,7 @@
 //! account. Nothing here is required to use the relay: pasting an endpoint
 //! string works without an API key at all.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -37,6 +38,11 @@ pub struct ProxyConfig {
     pub password: String,
     #[serde(default)]
     pub state: String,
+    /// Countries present in the proxy list, by proxy count. The backbone's
+    /// `-de` style country filter only picks from these, so a country missing
+    /// here is a 407 waiting to happen.
+    #[serde(default)]
+    pub countries: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -163,6 +169,12 @@ impl Client {
             "this Webshare account has no proxy configuration yet. \
              Open the dashboard once to provision it",
         )
+    }
+
+    /// Countries the account's proxy list actually contains, keyed by the
+    /// uppercase ISO code Webshare reports.
+    pub fn proxy_countries(&self) -> Result<BTreeMap<String, u64>> {
+        Ok(self.proxy_config()?.countries)
     }
 
     pub fn subscription(&self) -> Result<Option<Subscription>> {

@@ -80,8 +80,14 @@ it contains characters your shell would otherwise interpret.
 utsusemi connect "user-de-rotate:password@p.webshare.io:80"
 ```
 
-Utsusemi starts in the background and gives you your prompt back. Your desktop
-is now going through the proxy. When you are done:
+Before starting anything, `connect` opens one test tunnel through the endpoint.
+If the upstream rejects it, nothing is started and the Windows settings are
+left alone: a dead endpoint fails in your terminal instead of quietly breaking
+every request on the desktop. `switch` and `rotate` test the new endpoint the
+same way, and keep the current one if it does not work.
+
+Otherwise Utsusemi starts in the background and gives you your prompt back.
+Your desktop is now going through the proxy. When you are done:
 
 ```
 utsusemi disconnect
@@ -126,6 +132,12 @@ Webshare allows only one of city, state or zip at a time, and an ASN cannot be
 combined with a country. Utsusemi rejects those combinations before connecting
 rather than letting them silently do nothing.
 
+Country targeting only picks from the proxies your Webshare plan actually
+holds. Asking for a country that is not in your proxy list gets you a 407 from
+the backbone, so `connect` reports which countries your list does contain (it
+reads them from the API when you have a key stored) instead of leaving you with
+the bare rejection.
+
 ### Rotating and sticky sessions
 
 ```
@@ -156,6 +168,9 @@ utsusemi ip --direct   your real IP, to compare against
 utsusemi status        endpoint, targeting, uptime, connections, bytes moved
 utsusemi status --json same thing for scripts
 ```
+
+`status` also prints the most recent connection failure and its age, which is
+usually the fastest way to tell a broken upstream from an idle one.
 
 ### Proxying one program instead of the whole machine
 
